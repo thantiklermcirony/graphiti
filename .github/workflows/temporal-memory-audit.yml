@@ -1,0 +1,116 @@
+name: Graphiti temporal memory audit (Linux)
+
+on:
+  push:
+    branches: ['audit/temporal-memory']
+    paths:
+      - '.github/workflows/temporal-memory-audit.yml'
+      - 'audit/temporal-memory/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: graphiti-temporal-memory-audit
+  cancel-in-progress: false
+
+jobs:
+  neo4j-audit:
+    if: github.repository == 'thantiklermcirony/graphiti'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GRAPHITI_TELEMETRY_ENABLED: 'false'
+      PYTHONDONTWRITEBYTECODE: '1'
+      UV_NO_ENV_FILE: '1'
+    services:
+      neo4j:
+        image: neo4j:5.26.30-community
+        env:
+          NEO4J_AUTH: none
+          NEO4J_server_memory_heap_initial__size: 256m
+          NEO4J_server_memory_heap_max__size: 512m
+          NEO4J_server_memory_pagecache_size: 256m
+        ports:
+          - 127.0.0.1:17687:7687
+        options: >-
+          --health-cmd "cypher-shell 'RETURN 1'"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
+    steps:
+      - name: Checkout audit code from selected audit branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: audit-source
+          persist-credentials: false
+      - name: Checkout immutable baseline
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: getzep/graphiti
+          ref: eaa4128681bc53487138a4bbc22d58336ebe70d2
+          path: sources/baseline
+          persist-credentials: false
+      - name: Checkout immutable UTC fix
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: thantiklermcirony/graphiti
+          ref: 83ded3a6e027be978c78cecc68c920e278e98de1
+          path: sources/utc
+          persist-credentials: false
+      - name: Checkout immutable temporal fix
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: thantiklermcirony/graphiti
+          ref: 1e6289c1ee40c42dc588791217e3ee0efc175826
+          path: sources/temporal
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install pinned uv
+        run: python -m pip install uv==0.11.20
+      - name: Assemble the exact two public patches locally
+        run: |
+          python audit-source/audit/temporal-memory/assemble_sources.py \
+            --baseline sources/baseline --utc sources/utc --temporal sources/temporal \
+            --candidate sources/candidate --output evidence
+      - name: Install locked core and a small test dependency subset
+        working-directory: sources/candidate
+        run: |
+          uv --version > ../../evidence/uv-version.txt
+          uv export --frozen --no-dev --extra dev --no-emit-project --no-hashes \
+            --output-file ../../evidence/locked-constraints.txt
+          uv sync --frozen --no-dev --python python3.12
+          uv pip install --python .venv/bin/python \
+            --constraint ../../evidence/locked-constraints.txt pytest pytest-asyncio
+          uv pip freeze --python .venv/bin/python > ../../evidence/installed-packages.txt
+      - name: Record actual Neo4j image and runtime
+        env:
+          NEO4J_CONTAINER: ${{ job.services.neo4j.id }}
+        run: |
+          docker inspect "$NEO4J_CONTAINER" --format '{{json .Image}}' > evidence/neo4j-image-id.json
+          docker exec "$NEO4J_CONTAINER" neo4j --version > evidence/neo4j-version.txt
+          docker exec "$NEO4J_CONTAINER" java -version > evidence/java-version.txt 2>&1
+      - name: Run regressions, all database cases and isolated UTC roundtrips
+        run: |
+          sources/candidate/.venv/bin/python -B audit-source/audit/temporal-memory/run_audit.py \
+            --baseline sources/baseline --candidate sources/candidate --utc sources/utc \
+            --output evidence
+      - name: Capture database logs even on failure
+        if: always()
+        env:
+          NEO4J_CONTAINER: ${{ job.services.neo4j.id }}
+        run: |
+          mkdir -p evidence
+          docker logs "$NEO4J_CONTAINER" > evidence/neo4j-container.log 2>&1
+      - name: Upload evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: graphiti-temporal-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
