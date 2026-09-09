@@ -93,10 +93,10 @@ class AuditedNeo4jDriver(Neo4jDriver):
         self.query_hashes = Counter()
         super().__init__(uri=uri, user=None, password=None, database='neo4j')
 
-    async def execute_query(self, query, **kwargs):
+    async def execute_query(self, cypher_query_, **kwargs):
         self.calls[self.phase] += 1
-        self.query_hashes[hashlib.sha256(query.encode()).hexdigest()] += 1
-        return await super().execute_query(query, **kwargs)
+        self.query_hashes[hashlib.sha256(cypher_query_.encode()).hexdigest()] += 1
+        return await super().execute_query(cypher_query_, **kwargs)
 
 
 class SuppliedDecisionClient(LLMClient):
